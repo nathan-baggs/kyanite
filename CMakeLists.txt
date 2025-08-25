@@ -4,7 +4,7 @@ SET(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(
     kyanite
-    VERSION "0.0.1"
+    VERSION "0.0.2"
     DESCRIPTION "keepsake patch"
     LANGUAGES C CXX
 )
