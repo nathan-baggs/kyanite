@@ -1,42 +1,44 @@
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 #include <Windows.h>
 
 #include "utils.h"
 
+using namespace std::literals;
+
 namespace
 {
 
-auto patch_nullptr_check(
-    std::uintptr_t patch_point,
-    std::uintptr_t return_1_actual,
-    std::uintptr_t return_2_actual,
-    std::uintptr_t return_3_actual) -> void
+auto patch_star_init(std::uintptr_t patch_point, std::uintptr_t return_1_actual, std::uintptr_t cmp_address) -> void
 {
-    log("patching nullptr check at 0x{:x} with return addresses 0x{:x} and 0x{:x}",
-        patch_point,
-        return_1_actual,
-        return_2_actual);
+    log("patching star initialization check at 0x{:x}", patch_point);
 
     const auto fixed_asm_payload = ::VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     ensure(fixed_asm_payload != NULL, "failed to allocate memory for fixed assembly");
 
-    const auto return_1 = return_1_actual - reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - 0x5 - 4;
+    const auto return_1 = return_1_actual - reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - 0x5 - 36;
     const auto return_1_addr = reinterpret_cast<const std::uint8_t *>(&return_1);
 
-    const auto return_2 = return_2_actual - reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - 0x5 - 13;
-    const auto return_2_addr = reinterpret_cast<const std::uint8_t *>(&return_2);
-
-    const auto return_3 = return_3_actual - reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - 0x5 - 18;
-    const auto return_3_addr = reinterpret_cast<const std::uint8_t *>(&return_3);
+    const auto fixed_asm_adjusted = reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - patch_point - 0x5;
+    const auto fixed_asm_addr = reinterpret_cast<const std::uint8_t *>(&fixed_asm_adjusted);
 
     // clang-format off
     const std::uint8_t fixed_asm[] = {
-        0x83, 0xf9, 0x00, // cmp ecx, 0
-        0x0f, 0x84, return_1_addr[0], return_1_addr[1], return_1_addr[2], return_1_addr[3], // jne return_1_actual
-        0x3b, 0x4d, 0x90, // cmp ecx, [ebp-0x70] ; original instructions
-        0x0f, 0x85, return_2_addr[0], return_2_addr[1], return_2_addr[2], return_2_addr[3], // jne return_2_actual
-        0xe9, return_3_addr[0], return_3_addr[1], return_3_addr[2], return_3_addr[3], // jmp return_3_actual
+        // original instructions
+        0x8b, 0x8d, 0xac, 0xfd, 0xff, 0xff,      // mov ecx,dword ptr [ebp-0x254]
+        0x8b, 0x51, 0x1c,                        // mov edx,dword ptr [ecx + 0x1c]
+        0xc7, 0x04, 0x82, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [edx + eax*4], 0
+
+        // patched instructions
+        0x8b, 0x51, 0x38,                         // mov edx,dword ptr [ecx + 0x38]
+        0xc7, 0x04, 0x82, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [edx + eax*4], 0
+        0x8b, 0x51, 0x3c,                         // mov edx,dword ptr [ecx + 0x3c]
+        0xc7, 0x04, 0x82, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [edx + eax*4], 0
+
+        // jmp back
+        0xe9, return_1_addr[0], return_1_addr[1], return_1_addr[2], return_1_addr[3], // jmp return_actual
     };
     // clang-format on
 
@@ -44,12 +46,8 @@ auto patch_nullptr_check(
         ::WriteProcessMemory(GetCurrentProcess(), fixed_asm_payload, fixed_asm, sizeof(fixed_asm), NULL),
         "failed to write fixed assembly to process memory");
 
-    log("allocated memory for fixed assembly at {}", fixed_asm_payload);
-
-    const auto fixed_asm_adjusted = reinterpret_cast<std::uintptr_t>(fixed_asm_payload) - patch_point - 0x5;
-    const auto fixed_asm_addr = reinterpret_cast<const std::uint8_t *>(&fixed_asm_adjusted);
-
-    std::uint8_t jmp_to_fix[] = {0xe9, fixed_asm_addr[0], fixed_asm_addr[1], fixed_asm_addr[2], fixed_asm_addr[3]};
+    std::uint8_t jmp_to_fix[] = {
+        0xe9, fixed_asm_addr[0], fixed_asm_addr[1], fixed_asm_addr[2], fixed_asm_addr[3], 0x90};
 
     const auto patch_point_ptr = reinterpret_cast<std::uintptr_t *>(patch_point);
 
@@ -65,18 +63,45 @@ auto patch_nullptr_check(
     ensure(
         ::VirtualProtect(patch_point_ptr, sizeof(jmp_to_fix), old_protect, &old_protect),
         "failed to restore memory protection");
+
+    std::uint8_t nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+
+    ensure(
+        ::VirtualProtect(reinterpret_cast<void *>(cmp_address), sizeof(nops), PAGE_EXECUTE_READWRITE, &old_protect),
+        "failed to change memory protection");
+
+    ensure(
+        ::WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(cmp_address), nops, sizeof(nops), NULL),
+        "failed to write nops to process memory");
+
+    ensure(
+        ::VirtualProtect(reinterpret_cast<void *>(cmp_address), sizeof(nops), old_protect, &old_protect),
+        "failed to restore memory protection");
 }
 }
 
 extern "C"
 {
 
+__declspec(dllexport) void *WINAPIV my_new(unsigned int size)
+{
+    log("my_new called with size {}", size);
+
+    auto *ptr = ::operator new[](size);
+    ensure(ptr != nullptr, "failed to allocate memory with new");
+
+    ::memset(ptr, 0, size);
+
+    log("allocated memory at {}", ptr);
+
+    return ptr;
+}
+
 __declspec(dllexport) HRESULT WINAPI DirectDrawCreate(GUID FAR *lpGUID, void FAR **lplpDD, IUnknown FAR *pUnkOuter)
 {
     log("DirectDrawCreate called");
 
-    patch_nullptr_check(0x10044f03, 0x10044f10, 0x10044ea9, 0x10044f08);
-    patch_nullptr_check(0x10044fc6, 0x10044fd3, 0x10044f53, 0x10044fcb);
+    patch_star_init(0x100444cf, 0x100444df, 0x1004445d);
 
     const auto ddraw_dll = ::LoadLibraryA("C:\\Windows\\system32\\ddraw.dll");
     ensure(ddraw_dll != NULL, "failed to load ddraw.dll");
