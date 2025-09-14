@@ -2,5 +2,5 @@
 
 Fix for Keepsake
 
-- Adds a nullptr check in the path finding code so it doesn't crash
+- Correctly resets A* state
 - Copy ddraw.dll from release to game folder
